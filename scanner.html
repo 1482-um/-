@@ -7,10 +7,12 @@
 <meta name="theme-color" content="#0f172a">
 <title>棚卸スキャナー</title>
 <!--
-  貸与品管理台帳の「カメラをかざして読み取る」用ページです。
+  貸与品管理台帳の「カメラをかざして読み取る」と「カメラで撮る」で開くページです。
   Apps Script の画面の中ではカメラ映像を使えないため、このページだけを
   GitHub Pages などの https のサイトに置いて使います。
-  このページは台帳のデータを持たず、読み取った番号を開いた元の台帳の画面に渡すだけです。
+  ・QRコードの読み取り: scanner.html
+  ・貸与品の写真の撮影:  scanner.html?mode=photo
+  このページは台帳のデータを持たず、読み取った番号や撮った写真を、開いた元の台帳の画面に渡すだけです。
 -->
 <style>
   :root{
@@ -96,6 +98,24 @@
     height:100%;
     object-fit:cover;
   }
+  body.mode-photo .stage video{object-fit:contain;}
+  .still{
+    position:absolute;
+    inset:0;
+    width:100%;
+    height:100%;
+    object-fit:contain;
+    background:#000;
+  }
+  .flash{
+    position:absolute;
+    inset:0;
+    background:#fff;
+    opacity:0;
+    pointer-events:none;
+    transition:opacity .3s ease;
+  }
+  .flash.on{opacity:.8; transition:none;}
   .frame{
     position:absolute;
     left:50%;
@@ -194,9 +214,9 @@
     color:var(--ink-soft);
   }
 
-  .actions{display:flex; gap:8px; margin-top:12px;}
+  .actions{display:flex; flex-wrap:wrap; gap:8px; margin-top:12px;}
   .btn{
-    flex:1;
+    flex:1 1 40%;
     padding:12px 14px;
     border-radius:10px;
     border:1px solid #d1d5db;
@@ -206,9 +226,11 @@
     font-weight:600;
     cursor:pointer;
   }
+  .btn:disabled{opacity:.5; cursor:not-allowed;}
   .btn[aria-pressed="true"]{background:#fef9c3; border-color:#fde047;}
   .btn-primary{background:var(--accent); border-color:var(--accent); color:#fff;}
-  .btn-primary:hover{background:var(--accent-dark);}
+  .btn-primary:hover:not(:disabled){background:var(--accent-dark);}
+  .btn-shutter{flex-basis:100%; padding:15px 14px; font-size:16px;}
 
   .log{
     list-style:none;
@@ -239,20 +261,22 @@
   .log-state{flex:0 0 auto; color:var(--ink-soft); font-size:11.5px;}
 
   @media (prefers-reduced-motion: reduce){
-    .frame{transition:none;}
+    .frame,.flash{transition:none;}
   }
 </style>
 </head>
 <body>
 <div class="app">
   <header class="bar">
-    <h1>棚卸スキャナー</h1>
+    <h1 id="page-title">棚卸スキャナー</h1>
     <span class="conn" id="conn" data-state="searching">台帳を探しています</span>
   </header>
 
   <section class="stage" id="stage">
     <video id="video" playsinline muted autoplay></video>
+    <img class="still" id="still" alt="撮った写真" hidden>
     <div class="frame" id="frame" aria-hidden="true"></div>
+    <div class="flash" id="flash" aria-hidden="true"></div>
     <p class="hint" id="hint">QRコードを枠の中に入れてください</p>
     <div class="stage-msg" id="stage-msg">
       <div class="stage-msg-card">
@@ -267,13 +291,17 @@
       <p class="result-title" id="result-title">読み取り待ち</p>
       <p class="result-sub" id="result-sub">読み取った品目は、台帳の画面に自動で反映されます。</p>
     </div>
-    <div class="meta-row">
+    <div class="meta-row" id="meta-row">
       <span id="progress"></span>
       <span id="count">0 件読み取り</span>
     </div>
     <div class="actions">
+      <button type="button" class="btn btn-primary btn-shutter" id="shutter-btn" hidden>撮影する</button>
+      <button type="button" class="btn btn-primary" id="use-btn" hidden>この写真を使う</button>
+      <button type="button" class="btn" id="retake-btn" hidden>撮り直す</button>
       <button type="button" class="btn" id="torch-btn" aria-pressed="false" hidden>ライトをつける</button>
-      <button type="button" class="btn btn-primary" id="back-btn">台帳に戻る</button>
+      <button type="button" class="btn" id="switch-btn" hidden>カメラを切り替える</button>
+      <button type="button" class="btn" id="back-btn">台帳に戻る</button>
     </div>
     <ol class="log" id="log" aria-label="読み取った履歴"></ol>
   </section>
@@ -283,17 +311,27 @@
 (function () {
   'use strict';
 
+  // scanner.html?mode=photo で開かれたときは、貸与品の写真を撮る画面になる
+  const MODE = new URLSearchParams(location.search).get('mode') === 'photo' ? 'photo' : 'scan';
   const MSG = {
     hello: 'kashiyo-scanner:hello',
     ack: 'kashiyo-scanner:ack',
     code: 'kashiyo-scanner:code',
     result: 'kashiyo-scanner:result'
   };
+  const CAM = {
+    hello: 'kashiyo-camera:hello',
+    ack: 'kashiyo-camera:ack',
+    photo: 'kashiyo-camera:photo',
+    result: 'kashiyo-camera:result'
+  };
+  const HELLO = MODE === 'photo' ? CAM.hello : MSG.hello;
   const STORE_KEY = 'kashiyo-scanner:v1';
   const SAME_CODE_COOLDOWN_MS = 2500; // 同じQRを続けて読んだときは無視する時間
   const PAUSE_AFTER_HIT_MS = 900;     // 読み取った直後に少し休む時間
   const INTERVAL_NATIVE_MS = 120;
   const INTERVAL_JSQR_MS = 180;
+  const PHOTO_MAX_SIDE = 1600;        // 台帳に送る写真の大きさ（台帳側でさらに縮小して保存する）
   const JSQR_SOURCES = [
     'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js',
     'https://fastly.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js',
@@ -310,10 +348,13 @@
 
   const $ = id => document.getElementById(id);
   const els = {
-    conn: $('conn'), stage: $('stage'), video: $('video'), frame: $('frame'), hint: $('hint'),
+    title: $('page-title'), conn: $('conn'), stage: $('stage'), video: $('video'), still: $('still'),
+    frame: $('frame'), flash: $('flash'), hint: $('hint'),
     msg: $('stage-msg'), msgText: $('stage-msg-text'), startBtn: $('start-btn'),
     result: $('result'), resultTitle: $('result-title'), resultSub: $('result-sub'),
-    progress: $('progress'), count: $('count'), torch: $('torch-btn'), back: $('back-btn'), log: $('log')
+    metaRow: $('meta-row'), progress: $('progress'), count: $('count'),
+    shutter: $('shutter-btn'), use: $('use-btn'), retake: $('retake-btn'),
+    torch: $('torch-btn'), switchBtn: $('switch-btn'), back: $('back-btn'), log: $('log')
   };
 
   let state = loadState();
@@ -334,6 +375,15 @@
   let torchOn = false;
   let resumeOnVisible = false;
   let hitTimer = 0;
+  let videoDevices = [];
+  let chosenDeviceId = '';
+  // 写真モード用
+  let photoState = 'idle'; // idle → live → still → sending → done
+  let stillData = '';
+  let sendingId = '';
+  let sendTimer = 0;
+  let photoTarget = '';
+  let photoReady = null; // 台帳で登録・編集の画面が開いているか（null はまだ分からない）
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
@@ -371,7 +421,7 @@
       return false;
     }
   }
-  function sayHello() { post({ type: MSG.hello, v: 1 }); }
+  function sayHello() { post({ type: HELLO, v: 2 }); }
 
   function setConn(kind) {
     const text = {
@@ -396,20 +446,33 @@
     if (!hasOpener() || event.source !== window.opener) return;
     const d = event.data;
     if (!d || typeof d !== 'object') return;
-    if (d.type === MSG.ack) {
-      openerOrigin = event.origin;
-      connected = true;
-      setConn('connected');
-      updateProgress(d);
-      // まだ返事がない読み取りを送り直す（台帳側で二重には数えない）
-      state.pending.forEach(p => post({ type: MSG.code, id: p.id, code: p.code }));
-    } else if (d.type === MSG.result) {
-      openerOrigin = event.origin;
-      connected = true;
-      setConn('connected');
-      handleResult(d);
+    if (MODE === 'scan') {
+      if (d.type === MSG.ack) {
+        markConnected(event);
+        updateProgress(d);
+        // まだ返事がない読み取りを送り直す（台帳側で二重には数えない）
+        state.pending.forEach(p => post({ type: MSG.code, id: p.id, code: p.code }));
+      } else if (d.type === MSG.result) {
+        markConnected(event);
+        handleResult(d);
+      }
+    } else {
+      if (d.type === CAM.ack) {
+        markConnected(event);
+        photoReady = !!d.ready;
+        photoTarget = d.ready ? String(d.target || '') : '';
+        if (photoState === 'idle' || photoState === 'live') showPhotoGuide();
+      } else if (d.type === CAM.result) {
+        markConnected(event);
+        handlePhotoResult(d);
+      }
     }
   });
+  function markConnected(event) {
+    openerOrigin = event.origin;
+    connected = true;
+    setConn('connected');
+  }
 
   // 台帳がつながるまで呼びかけ続ける
   setInterval(() => {
@@ -463,7 +526,7 @@
   }
   function hideMessage() { els.msg.hidden = true; }
 
-  // ---------------- 読み取ったときの合図 ----------------
+  // ---------------- 読み取ったとき・撮ったときの合図 ----------------
   function unlockAudio() {
     try {
       const AC = window.AudioContext || window.webkitAudioContext;
@@ -496,8 +559,12 @@
     if (navigator.vibrate) { try { navigator.vibrate(60); } catch (e) {} }
     beep();
   }
+  function flash() {
+    els.flash.classList.add('on');
+    requestAnimationFrame(() => requestAnimationFrame(() => els.flash.classList.remove('on')));
+  }
 
-  // ---------------- 読み取り結果の扱い ----------------
+  // ---------------- QRの読み取り結果の扱い ----------------
   function onCode(raw) {
     const code = String(raw == null ? '' : raw).trim();
     if (!code) return;
@@ -545,17 +612,97 @@
     }
   }
 
+  // ---------------- 写真モード ----------------
+  function setPhotoState(next) {
+    photoState = next;
+    const still = next === 'still' || next === 'sending' || next === 'done';
+    els.still.hidden = !still;
+    els.shutter.hidden = next !== 'live';
+    els.use.hidden = !still;
+    els.retake.hidden = !still;
+    els.use.disabled = next !== 'still';
+    els.retake.disabled = next !== 'still';
+    els.hint.hidden = next !== 'live';
+  }
+  function showPhotoGuide() {
+    if (photoReady === false) {
+      showResult('warn', '台帳の登録画面が開いていません', '台帳で「＋ 貸与品を登録」か「編集」の画面を開いてから撮影してください。');
+      return;
+    }
+    const target = photoTarget ? `「${photoTarget}」の写真を撮ります。` : '';
+    if (photoState === 'live') {
+      showResult('idle', '撮影の準備ができました', target + '撮りたい物を画面に入れて「撮影する」を押してください。');
+    } else {
+      showResult('idle', '撮影の準備', target + '「カメラを開始」を押して、撮りたい物を画面に入れてから「撮影する」を押してください。');
+    }
+  }
+  function capture() {
+    const v = els.video;
+    if (!v.videoWidth || !v.videoHeight) return;
+    const scale = Math.min(1, PHOTO_MAX_SIDE / Math.max(v.videoWidth, v.videoHeight));
+    const w = Math.round(v.videoWidth * scale);
+    const h = Math.round(v.videoHeight * scale);
+    const c = document.createElement('canvas');
+    c.width = w;
+    c.height = h;
+    c.getContext('2d').drawImage(v, 0, 0, w, h);
+    stillData = c.toDataURL('image/jpeg', 0.9);
+    els.still.src = stillData;
+    flash();
+    beep();
+    setPhotoState('still');
+    showResult('idle', 'この写真でよければ「この写真を使う」を押してください', 'うまく撮れていなければ「撮り直す」を押してください。');
+  }
+  function retake() {
+    stillData = '';
+    els.still.removeAttribute('src');
+    setPhotoState('live');
+    showPhotoGuide();
+  }
+  function sendPhoto() {
+    if (!stillData || photoState !== 'still') return;
+    const id = makeId();
+    sendingId = id;
+    if (!post({ type: CAM.photo, id, dataUrl: stillData })) {
+      showResult('error', '台帳の画面が見つかりません', '台帳の登録・編集画面で「カメラで撮る」を押して、開き直してください。');
+      return;
+    }
+    setPhotoState('sending');
+    showResult('pending', '台帳に写真を送っています…', '');
+    clearTimeout(sendTimer);
+    sendTimer = setTimeout(() => {
+      if (photoState !== 'sending') return;
+      setPhotoState('still');
+      showResult('warn', '台帳から返事がありません', '台帳の画面を確認してください。写真が入っていなければ、もう一度「この写真を使う」を押してください。');
+    }, 8000);
+  }
+  function handlePhotoResult(d) {
+    if (!d.id || d.id !== sendingId) return;
+    clearTimeout(sendTimer);
+    if (d.ok) {
+      setPhotoState('done');
+      showResult('ok', '台帳に写真を入れました', 'この画面は自動で閉じます。台帳で「登録する」（編集のときは「更新する」）を押すと保存されます。');
+      setTimeout(() => {
+        stopCamera();
+        window.close();
+      }, 1500);
+    } else {
+      setPhotoState('still');
+      showResult('warn', '写真を入れられませんでした', d.reason || '');
+    }
+  }
+
   // ---------------- カメラ ----------------
   function cameraErrorText(err) {
     const name = err && err.name ? err.name : '';
     if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || name === 'SecurityError') {
-      return 'カメラの使用が許可されていません。ブラウザのサイト設定でカメラを「許可」にしてから、もう一度押してください。（iPhoneはアドレスバーの「ぁあ」→ Webサイトの設定、Androidはアドレスバー左のアイコン → 権限）';
+      return 'カメラの使用が許可されていません。ブラウザのサイト設定でカメラを「許可」にしてから、もう一度押してください。（PCはアドレスバー左のアイコン、iPhoneはアドレスバーの「ぁあ」→ Webサイトの設定、Androidはアドレスバー左のアイコン → 権限）';
     }
     if (name === 'NotFoundError' || name === 'DevicesNotFoundError' || name === 'OverconstrainedError') {
-      return 'カメラが見つかりませんでした。カメラのある端末で開いてください。';
+      return 'カメラが見つかりませんでした。カメラのある端末で開くか、PCにカメラをつないでください。';
     }
     if (name === 'NotReadableError' || name === 'TrackStartError' || name === 'AbortError') {
-      return 'カメラを起動できませんでした。ほかのアプリがカメラを使っていたら閉じてから、もう一度押してください。';
+      return 'カメラを起動できませんでした。ほかのアプリ（Web会議など）がカメラを使っていたら閉じてから、もう一度押してください。';
     }
     return 'カメラを起動できませんでした' + (name ? `（${name}）` : '') + '。ページを再読み込みしてから、もう一度押してください。';
   }
@@ -563,22 +710,20 @@
   async function startCamera() {
     unlockAudio();
     if (!window.isSecureContext || !navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-      showMessage('このブラウザではカメラを使えません。iPhoneはSafari、AndroidはChromeでこのページを開いてください（LINEなどのアプリ内ブラウザでは使えないことがあります）。', '');
+      showMessage('このブラウザではカメラを使えません。iPhoneはSafari、AndroidはChrome、PCはChromeやEdgeでこのページを開いてください（LINEなどのアプリ内ブラウザでは使えないことがあります）。', '');
       return;
     }
     hideMessage();
     stopCamera();
+    const size = MODE === 'photo' ? { width: { ideal: 1920 }, height: { ideal: 1080 } } : { width: { ideal: 1280 }, height: { ideal: 720 } };
+    const video = chosenDeviceId
+      ? Object.assign({ deviceId: { exact: chosenDeviceId } }, size)
+      : Object.assign({ facingMode: { ideal: 'environment' } }, size);
     try {
-      stream = await navigator.mediaDevices.getUserMedia({
-        audio: false,
-        video: {
-          facingMode: { ideal: 'environment' },
-          width: { ideal: 1280 },
-          height: { ideal: 720 }
-        }
-      });
+      stream = await navigator.mediaDevices.getUserMedia({ audio: false, video });
     } catch (err) {
       stream = null;
+      if (chosenDeviceId) chosenDeviceId = '';
       showMessage(cameraErrorText(err), 'もう一度試す');
       return;
     }
@@ -590,15 +735,23 @@
     track = stream.getVideoTracks()[0] || null;
     if (track) {
       track.addEventListener('ended', () => {
-        if (scanning) {
+        if (scanning || photoState === 'live') {
           stopCamera();
           showMessage('カメラが止まりました。', 'カメラを再開');
         }
       });
     }
     setupTorch();
-    scanning = true;
-    requestAnimationFrame(tick);
+    refreshDevices();
+    if (MODE === 'photo') {
+      if (photoState === 'idle' || photoState === 'live') {
+        setPhotoState('live');
+        showPhotoGuide();
+      }
+    } else {
+      scanning = true;
+      requestAnimationFrame(tick);
+    }
   }
 
   function stopCamera() {
@@ -611,6 +764,25 @@
     torchOn = false;
     updateTorchButton();
     els.video.srcObject = null;
+  }
+
+  // PCに複数のカメラがつながっているときは、切り替えボタンを出す
+  async function refreshDevices() {
+    try {
+      const all = await navigator.mediaDevices.enumerateDevices();
+      videoDevices = all.filter(d => d.kind === 'videoinput');
+    } catch (e) {
+      videoDevices = [];
+    }
+    els.switchBtn.hidden = videoDevices.length < 2;
+  }
+  function switchCamera() {
+    if (videoDevices.length < 2) return;
+    let current = '';
+    try { current = track && track.getSettings ? track.getSettings().deviceId || '' : ''; } catch (e) {}
+    const idx = videoDevices.findIndex(d => d.deviceId === current);
+    chosenDeviceId = videoDevices[(idx + 1) % videoDevices.length].deviceId;
+    startCamera();
   }
 
   function setupTorch() {
@@ -632,7 +804,7 @@
     updateTorchButton();
   }
 
-  // ---------------- 読み取り ----------------
+  // ---------------- QRの読み取り ----------------
   function tick(now) {
     if (!scanning) return;
     requestAnimationFrame(tick);
@@ -718,6 +890,10 @@
   // ---------------- 画面の操作 ----------------
   els.startBtn.addEventListener('click', startCamera);
   els.torch.addEventListener('click', toggleTorch);
+  els.switchBtn.addEventListener('click', switchCamera);
+  els.shutter.addEventListener('click', capture);
+  els.use.addEventListener('click', sendPhoto);
+  els.retake.addEventListener('click', retake);
   els.back.addEventListener('click', () => {
     stopCamera();
     window.close();
@@ -737,8 +913,8 @@
         stopCamera();
       }
     } else {
-      sayHello(); // 台帳とのつながりを確かめ、届いていない分を送り直す
-      if (resumeOnVisible) {
+      sayHello(); // 台帳とのつながりを確かめる（読み取りモードでは、届いていない分も送り直す）
+      if (resumeOnVisible && photoState !== 'done') {
         resumeOnVisible = false;
         startCamera();
       }
@@ -747,16 +923,32 @@
   window.addEventListener('pagehide', stopCamera);
 
   // ---------------- はじめに ----------------
-  renderLog();
-  loadJsQr();
-  initDetector();
+  if (MODE === 'photo') {
+    document.body.classList.add('mode-photo');
+    document.title = '写真を撮る';
+    els.title.textContent = '写真を撮る';
+    els.frame.hidden = true;
+    els.metaRow.hidden = true;
+    els.log.hidden = true;
+    els.hint.textContent = '撮りたい物を画面に入れてください';
+    els.hint.hidden = true;
+    showPhotoGuide();
+    // 台帳の窓に戻って登録画面を開いてから、こちらに戻ってきたときに状態を確かめ直す
+    window.addEventListener('focus', sayHello);
+  } else {
+    renderLog();
+    loadJsQr();
+    initDetector();
+  }
   if (hasOpener()) {
     setConn('searching');
     sayHello();
-    showMessage('QRコードを読み取るためにカメラを使います。', 'カメラを開始');
+    showMessage(MODE === 'photo' ? '貸与品の写真を撮るためにカメラを使います。' : 'QRコードを読み取るためにカメラを使います。', 'カメラを開始');
   } else {
     setConn('lost');
-    showMessage('このページは、台帳の「カメラをかざして読み取る」ボタンから開いてください。ここから直接開くと、読み取った結果は台帳に届きません。', 'カメラを試す');
+    showMessage(MODE === 'photo'
+      ? 'このページは、台帳の登録・編集画面の「カメラで撮る」ボタンから開いてください。ここから直接開くと、撮った写真は台帳に届きません。'
+      : 'このページは、台帳の「カメラをかざして読み取る」ボタンから開いてください。ここから直接開くと、読み取った結果は台帳に届きません。', 'カメラを試す');
   }
 })();
 </script>
