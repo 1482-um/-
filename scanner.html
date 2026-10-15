@@ -99,6 +99,8 @@
     object-fit:cover;
   }
   body.mode-photo .stage video{object-fit:contain;}
+  /* PCのカメラは鏡のように左右反転して表示する（保存する写真は反転しない） */
+  .stage video.mirrored{transform:scaleX(-1);}
   .still{
     position:absolute;
     inset:0;
@@ -231,6 +233,8 @@
   .btn-primary{background:var(--accent); border-color:var(--accent); color:#fff;}
   .btn-primary:hover:not(:disabled){background:var(--accent-dark);}
   .btn-shutter{flex-basis:100%; padding:15px 14px; font-size:16px;}
+  #mirror-btn[aria-pressed="true"]{background:#fff; border-color:#d1d5db;}
+  .page-ver{margin:10px 0 0; text-align:right; font-size:10.5px; color:#94a3b8;}
 
   .log{
     list-style:none;
@@ -301,9 +305,11 @@
       <button type="button" class="btn" id="retake-btn" hidden>撮り直す</button>
       <button type="button" class="btn" id="torch-btn" aria-pressed="false" hidden>ライトをつける</button>
       <button type="button" class="btn" id="switch-btn" hidden>カメラを切り替える</button>
+      <button type="button" class="btn" id="mirror-btn" aria-pressed="false" hidden>ミラー表示: オフ</button>
       <button type="button" class="btn" id="back-btn">台帳に戻る</button>
     </div>
     <ol class="log" id="log" aria-label="読み取った履歴"></ol>
+    <p class="page-ver">スキャナーページ v3</p>
   </section>
 </div>
 
@@ -354,7 +360,7 @@
     result: $('result'), resultTitle: $('result-title'), resultSub: $('result-sub'),
     metaRow: $('meta-row'), progress: $('progress'), count: $('count'),
     shutter: $('shutter-btn'), use: $('use-btn'), retake: $('retake-btn'),
-    torch: $('torch-btn'), switchBtn: $('switch-btn'), back: $('back-btn'), log: $('log')
+    torch: $('torch-btn'), switchBtn: $('switch-btn'), mirror: $('mirror-btn'), back: $('back-btn'), log: $('log')
   };
 
   let state = loadState();
@@ -377,6 +383,9 @@
   let hitTimer = 0;
   let videoDevices = [];
   let chosenDeviceId = '';
+  let mirrorAvailable = false; // 自分の方を向いたカメラ（PCのカメラ・スマホの内側カメラ）のとき true
+  let mirrorOn = false;
+  const MIRROR_KEY = 'kashiyo-camera-mirror';
   // 写真モード用
   let photoState = 'idle'; // idle → live → still → sending → done
   let stillData = '';
@@ -651,7 +660,8 @@
     flash();
     beep();
     setPhotoState('still');
-    showResult('idle', 'この写真でよければ「この写真を使う」を押してください', 'うまく撮れていなければ「撮り直す」を押してください。');
+    showResult('idle', 'この写真でよければ「この写真を使う」を押してください',
+      'うまく撮れていなければ「撮り直す」を押してください。' + (mirrorOn ? '保存される写真は、文字が正しく読める向き（左右反転なし）になります。' : ''));
   }
   function retake() {
     stillData = '';
@@ -742,6 +752,7 @@
       });
     }
     setupTorch();
+    setupMirror();
     refreshDevices();
     if (MODE === 'photo') {
       if (photoState === 'idle' || photoState === 'live') {
@@ -783,6 +794,32 @@
     const idx = videoDevices.findIndex(d => d.deviceId === current);
     chosenDeviceId = videoDevices[(idx + 1) % videoDevices.length].deviceId;
     startCamera();
+  }
+
+  // PCのカメラは、鏡を見るように左右反転して表示する（そのほうが写したい物を画面の中に入れやすい）。
+  // スマホの外側カメラはそのまま表示する。どちらの場合も、保存する写真は反転しない
+  function setupMirror() {
+    let facing = '';
+    try { facing = (track && track.getSettings && track.getSettings().facingMode) || ''; } catch (e) {}
+    const touch = !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches);
+    // カメラの向きが分かればそれで決め、分からなければ「スマホなら外側、PCなら自分向き」とみなす
+    mirrorAvailable = facing ? facing === 'user' : !touch;
+    let pref = '';
+    try { pref = localStorage.getItem(MIRROR_KEY) || ''; } catch (e) {}
+    mirrorOn = mirrorAvailable && pref !== 'off';
+    applyMirror();
+  }
+  function applyMirror() {
+    els.video.classList.toggle('mirrored', mirrorOn);
+    els.mirror.hidden = !mirrorAvailable;
+    els.mirror.setAttribute('aria-pressed', mirrorOn ? 'true' : 'false');
+    els.mirror.textContent = mirrorOn ? 'ミラー表示: オン' : 'ミラー表示: オフ';
+  }
+  function toggleMirror() {
+    if (!mirrorAvailable) return;
+    mirrorOn = !mirrorOn;
+    try { localStorage.setItem(MIRROR_KEY, mirrorOn ? 'on' : 'off'); } catch (e) {}
+    applyMirror();
   }
 
   function setupTorch() {
@@ -891,6 +928,7 @@
   els.startBtn.addEventListener('click', startCamera);
   els.torch.addEventListener('click', toggleTorch);
   els.switchBtn.addEventListener('click', switchCamera);
+  els.mirror.addEventListener('click', toggleMirror);
   els.shutter.addEventListener('click', capture);
   els.use.addEventListener('click', sendPhoto);
   els.retake.addEventListener('click', retake);
